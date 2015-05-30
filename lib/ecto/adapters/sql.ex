@@ -114,8 +114,6 @@ defmodule Ecto.Adapters.SQL do
     end
   end
 
-  alias Ecto.Adapters.Worker
-
   @doc """
   Runs custom SQL query on given repo.
 
@@ -155,8 +153,8 @@ defmodule Ecto.Adapters.SQL do
         # it is converted to {:nodedown, node}. This means the exit
         # reason can be easily identified.
         exit({:noconnect, {__MODULE__, :query, [repo, sql, params, opts]}})
-      %{module: module, conn: conn} ->
-        query!(repo, module, conn, sql, params, nil, opts)
+      %{conn_mod: conn_mod, conn: conn} ->
+        query!(repo, conn_mod, conn, sql, params, nil, opts)
       nil ->
         pool_query!(repo, pool, sql, params, opts)
     end
@@ -166,16 +164,16 @@ defmodule Ecto.Adapters.SQL do
     timeout = Keyword.get(opts, :timeout)
 
     {queue_time, {query_time, res}} =
-      pool_transaction(repo, pool, timeout, fn time, worker ->
-        {module, conn} = Worker.ask!(worker, timeout)
-        {time, :timer.tc(module, :query, [conn, sql, params, opts])}
+      pool_transaction(repo, pool, timeout, fn time, worker_mod, worker ->
+        {conn_mod, conn} = worker_mod.ask!(worker, timeout)
+        {time, :timer.tc(conn_mod, :query, [conn, sql, params, opts])}
       end)
 
     log_and_check(repo, sql, params, query_time, queue_time, opts, res)
   end
 
-  defp query!(repo, module, conn, sql, params, queue_time, opts) do
-    {query_time, res} = :timer.tc(module, :query, [conn, sql, params, opts])
+  defp query!(repo, conn_mod, conn, sql, params, queue_time, opts) do
+    {query_time, res} = :timer.tc(conn_mod, :query, [conn, sql, params, opts])
     log_and_check(repo, sql, params, query_time, queue_time, opts, res)
   end
 
@@ -291,12 +289,12 @@ defmodule Ecto.Adapters.SQL do
       raise "cannot #{event} test transaction because we are already inside a regular transaction"
     end
 
-    pool_transaction(repo, pool, timeout, fn time, worker ->
-      case Worker.sandbox_transaction(worker, timeout) do
-        {:ok, {module, conn}} ->
-          begin_sandbox!(repo, module, conn, time, opts)
-        {:sandbox, {module, conn}} when event == :restart ->
-          restart_sandbox!(repo, module, conn, time, opts)
+    pool_transaction(repo, pool, timeout, fn time, worker_mod, worker ->
+      case worker_mod.sandbox_transaction(worker, timeout) do
+        {:ok, {conn_mod, conn}} ->
+          begin_sandbox!(repo, conn_mod, conn, time, opts)
+        {:sandbox, {conn_mod, conn}} when event == :restart ->
+          restart_sandbox!(repo, conn_mod, conn, time, opts)
         {:sandbox, _} when event == :begin ->
           raise "cannot begin test transaction because we are already inside one"
         {:error, err} ->
@@ -307,13 +305,13 @@ defmodule Ecto.Adapters.SQL do
     :ok
   end
 
-  defp begin_sandbox!(repo, module, conn, queue_time, opts) do
-    query!(repo, module, conn, module.begin_transaction, [], queue_time, opts)
-    query!(repo, module, conn, module.savepoint("ecto_sandbox"), [], nil, opts)
+  defp begin_sandbox!(repo, conn_mod, conn, queue_time, opts) do
+    query!(repo, conn_mod, conn, conn_mod.begin_transaction, [], queue_time, opts)
+    query!(repo, conn_mod, conn, conn_mod.savepoint("ecto_sandbox"), [], nil, opts)
   end
 
-  defp restart_sandbox!(repo, module, conn, queue_time, opts) do
-    query!(repo, module, conn, module.rollback_to_savepoint("ecto_sandbox"), [], queue_time, opts)
+  defp restart_sandbox!(repo, conn_mod, conn, queue_time, opts) do
+    query!(repo, conn_mod, conn, conn_mod.rollback_to_savepoint("ecto_sandbox"), [], queue_time, opts)
   end
 
   @spec rollback_test_transaction(Ecto.Repo.t, Keyword.t) :: :ok
@@ -322,11 +320,11 @@ defmodule Ecto.Adapters.SQL do
     opts = Keyword.put_new(opts, :timeout, timeout)
     timeout = Keyword.get(opts, :timeout)
 
-    pool_transaction(repo, pool, timeout, fn time, worker ->
-      worker_fuse(pool, worker, timeout, fn ->
-        {module, conn} = Worker.ask!(worker, timeout)
-        query!(repo, module, conn, module.rollback, [], time, opts)
-        Worker.close_transaction(worker, timeout)
+    pool_transaction(repo, pool, timeout, fn time, worker_mod, worker ->
+      worker_fuse(pool, worker_mod, worker, timeout, fn ->
+        {conn_mod, conn} = worker_mod.ask!(worker, timeout)
+        query!(repo, conn_mod, conn, conn_mod.rollback, [], time, opts)
+        worker_mod.close_transaction(worker, timeout)
       end)
     end)
 
@@ -337,22 +335,22 @@ defmodule Ecto.Adapters.SQL do
 
   @doc false
   def __before_compile__(env) do
-    timeout =
+    config =
       env.module
       |> Module.get_attribute(:config)
-      |> Keyword.get(:timeout, 5000)
+
+    timeout = Keyword.get(config, :timeout, 5000)
+    pool_mod = Keyword.get(config, :pool, Ecto.Adapters.Poolboy)
 
     quote do
       def __pool__ do
-        {__MODULE__.Pool, unquote(timeout)}
+        {{unquote(pool_mod), __MODULE__.Pool}, unquote(timeout)}
       end
     end
   end
 
   @doc false
   def start_link(connection, adapter, repo, opts) do
-    {pool_opts, worker_opts} = split_opts(repo, opts)
-
     unless Code.ensure_loaded?(connection) do
       raise """
       could not find #{inspect connection}.
@@ -366,31 +364,17 @@ defmodule Ecto.Adapters.SQL do
           mix deps.clean ecto
       """
     end
+    {pool_mod, pool_name} = elem(repo.__pool__, 0)
 
-    :poolboy.start_link(pool_opts, {connection, worker_opts})
+    opts = opts
+      |> Keyword.put(:timeout, Keyword.get(opts, :connect_timeout, 5000))
+    pool_mod.start_link(connection, [name: pool_name] ++ opts)
   end
 
   @doc false
   def stop(repo) do
-    :poolboy.stop elem(repo.__pool__, 0)
-  end
-
-  defp split_opts(repo, opts) do
-    pool_name = elem(repo.__pool__, 0)
-    {pool_opts, worker_opts} = Keyword.split(opts, [:size, :max_overflow])
-
-    pool_opts = pool_opts
-      |> Keyword.put_new(:size, 10)
-      |> Keyword.put_new(:max_overflow, 0)
-
-    pool_opts =
-      [name: {:local, pool_name},
-       worker_module: Worker] ++ pool_opts
-
-    worker_opts = worker_opts
-      |> Keyword.put(:timeout, Keyword.get(worker_opts, :connect_timeout, 5000))
-
-    {pool_opts, worker_opts}
+    {pool_mod, pool_name, _} = elem(repo.__pool__, 0)
+    pool_mod.stop(pool_name)
   end
 
   ## Query
@@ -457,7 +441,7 @@ defmodule Ecto.Adapters.SQL do
     opts    = Keyword.put_new(opts, :timeout, timeout)
     timeout = Keyword.get(opts, :timeout)
 
-    {queue_time, _worker} =
+    {queue_time, _worker_mod, _worker} =
       open_transaction(key, repo, pool, timeout)
 
     try do
@@ -480,38 +464,40 @@ defmodule Ecto.Adapters.SQL do
 
   defp open_transaction(key, repo, pool, timeout) do
     case Process.get(key) do
-      %{worker: worker} ->
-        {nil, worker}
+      %{worker_mod: worker_mod, worker: worker} ->
+        {nil, worker_mod, worker}
       nil ->
-        {time, worker} = checkout(repo, pool, timeout)
+        {time, worker_mod, worker} = checkout(repo, pool, timeout)
 
-        pool_fuse(pool, worker, fn ->
-          case Worker.open_transaction(worker, timeout) do
-            {:ok, {module, conn}} ->
+        pool_fuse(pool, worker_mod, worker, fn ->
+          case worker_mod.open_transaction(worker, timeout) do
+            {:ok, {conn_mod, conn}} ->
               # We got permission to start a transaction
-              Process.put(key, %{worker: worker, module: module, conn: conn,
+              Process.put(key, %{worker_mod: worker_mod, worker: worker,
+                                 conn_mod: conn_mod, conn: conn,
                                  counter: 0, threshold: 0})
-            {:sandbox, {module, conn}} ->
+            {:sandbox, {conn_mod, conn}} ->
               # Inside sandbox we only emit savepoints
-              Process.put(key, %{worker: worker, module: module, conn: conn,
+              Process.put(key, %{worker_mod: worker_mod, worker: worker,
+                                 conn_mod: conn_mod, conn: conn,
                                  counter: 1, threshold: 1})
             {:error, err} ->
               raise err
           end
         end)
 
-        {time, worker}
+        {time, worker_mod, worker}
     end
   end
 
   defp begin_transaction(key, repo, pool, queue_time, timeout, opts) do
-    %{worker: worker, module: module,
+    %{worker_mod: worker_mod, worker: worker, conn_mod: conn_mod,
       conn: conn, counter: counter} = info = Process.get(key)
 
     query =
       case counter do
-        0 -> module.begin_transaction
-        _ -> module.savepoint "ecto_#{counter}"
+        0 -> conn_mod.begin_transaction
+        _ -> conn_mod.savepoint "ecto_#{counter}"
       end
 
     # We need to bump the counter before going into
@@ -520,43 +506,44 @@ defmodule Ecto.Adapters.SQL do
     # must be correct.
     Process.put(key, %{info | counter: counter + 1})
 
-    worker_fuse(pool, worker, timeout, fn ->
-      query!(repo, module, conn, query, [], queue_time, opts)
+    worker_fuse(pool, worker_mod, worker, timeout, fn ->
+      query!(repo, conn_mod, conn, query, [], queue_time, opts)
     end)
   end
 
   defp commit_transaction(key, repo, pool, timeout, opts) do
-    %{worker: worker, module: module,
+    %{worker_mod: worker_mod, worker: worker, conn_mod: conn_mod,
       conn: conn, counter: counter} = Process.get(key)
     counter = counter - 1
 
     if conn && counter == 0 do
-      worker_fuse(pool, worker, timeout, fn ->
-        query!(repo, module, conn, module.commit, [], nil, opts)
-        Worker.close_transaction(worker, timeout)
+      worker_fuse(pool, worker_mod, worker, timeout, fn ->
+        query!(repo, conn_mod, conn, conn_mod.commit, [], nil, opts)
+        worker_mod.close_transaction(worker, timeout)
       end)
     end
   end
 
   defp rollback_transaction(key, repo, pool, timeout, opts) do
-    %{worker: worker, module: module, conn: conn, counter: counter} = Process.get(key)
+    %{worker_mod: worker_mod, worker: worker, conn_mod: conn_mod, conn: conn,
+      counter: counter} = Process.get(key)
     counter = counter - 1
 
     query = case counter do
-      0 -> module.rollback
-      _ -> module.rollback_to_savepoint("ecto_#{counter}")
+      0 -> conn_mod.rollback
+      _ -> conn_mod.rollback_to_savepoint("ecto_#{counter}")
     end
 
-    worker_fuse(pool, worker, timeout, fn ->
+    worker_fuse(pool, worker_mod, worker, timeout, fn ->
       # We may lose the connection in case worker_fuse was triggered.
       # So we need to check to avoid further raising on rollback.
       if conn do
-        query!(repo, module, conn, query, [], nil, opts)
+        query!(repo, conn_mod, conn, query, [], nil, opts)
       end
 
       # If counter is 0, time to close the transaction.
       if counter == 0 do
-        Worker.close_transaction(worker, timeout)
+        worker_mod.close_transaction(worker, timeout)
       end
     end)
   end
@@ -564,13 +551,14 @@ defmodule Ecto.Adapters.SQL do
   # Note maybe_checkin needs to re-read the process dictionary
   # because worker_fuse may have cleaned up the connection and
   # we should not put it back.
-  defp maybe_checkin(key, pool) do
-    %{worker: worker, counter: counter, threshold: threshold} = info = Process.get(key)
+  defp maybe_checkin(key, {pool_mod, pool_name}) do
+    %{worker_mod: worker_mod, worker: worker,
+      counter: counter, threshold: threshold} = info = Process.get(key)
     counter = counter - 1
 
     if counter == threshold do
       Process.delete(key)
-      :poolboy.checkin(pool, worker)
+      pool_mod.checkin(pool_name, worker_mod, worker)
     else
       Process.put(key, %{info | counter: counter})
     end
@@ -578,39 +566,41 @@ defmodule Ecto.Adapters.SQL do
 
   ## Helpers
 
-  defp checkout(repo, pool, timeout) do
+  defp checkout(repo, {pool_mod, pool_name}, timeout) do
     try do
-      :timer.tc(:poolboy, :checkout, [pool, true, timeout])
+      :timer.tc(pool_mod, :checkout, [pool_name, timeout])
     catch
       :exit, {:noproc, _} ->
         raise ArgumentError, "repo #{inspect repo} is not started, " <>
                              "please ensure it is part of your supervision tree"
+    else
+      {time, {worker_mod, worker}} -> {time, worker_mod, worker}
     end
   end
 
-  defp pool_transaction(repo, pool, timeout, fun) do
-    {time, worker} = checkout(repo, pool, timeout)
+  defp pool_transaction(repo, {pool_mod, pool_name} = pool, timeout, fun) do
+    {time, worker_mod, worker} = checkout(repo, pool, timeout)
 
     try do
-      fun.(time, worker)
+      fun.(time, worker_mod, worker)
     after
-      :ok = :poolboy.checkin(pool, worker)
+      :ok = pool_mod.checkin(pool_name, worker_mod, worker)
     end
   end
 
   # A fuse performs clean up only if something goes wrong.
   # They are different from transactions that always clean up.
 
-  defp pool_fuse(pool, worker, fun) do
+  defp pool_fuse({pool_mod, pool_name}, worker_mod, worker, fun) do
     fun.()
   catch
     kind, reason ->
       stack = System.stacktrace()
-      :poolboy.checkin(pool, worker)
+      pool_mod.checkin(pool_name, worker_mod, worker)
       :erlang.raise(kind, reason, stack)
   end
 
-  defp worker_fuse(pool, worker, timeout, fun) do
+  defp worker_fuse(pool, worker_mod, worker, timeout, fun) do
     fun.()
   catch
     kind, reason ->
@@ -620,7 +610,7 @@ defmodule Ecto.Adapters.SQL do
       stack = System.stacktrace()
       key   = {:ecto_transaction_info, pool}
       Process.put(key, %{Process.get(key) | conn: nil})
-      Worker.break_transaction(worker, timeout)
+      worker_mod.break_transaction(worker, timeout)
       :erlang.raise(kind, reason, stack)
   end
 end

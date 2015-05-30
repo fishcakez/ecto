@@ -32,6 +32,9 @@ defmodule Ecto.Mixfile do
 
   defp deps do
     [{:poolboy, "~> 1.4"},
+     {:sbroker, "~> 0.6.2"},
+     {:connection, "~> 0.0.1", github: "fishcakez/connection"},
+     {:backoff, "~> 1.1.1", github: "ferd/backoff"},
      {:decimal, "~> 1.0"},
      {:postgrex, "~> 0.8.0", optional: true},
      {:mariaex, "~> 0.1.0", optional: true},
