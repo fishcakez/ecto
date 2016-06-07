@@ -79,7 +79,12 @@ if Code.ensure_loaded?(Postgrex) do
 
     def execute(conn, sql, params, opts) when is_binary(sql) do
       query = %Postgrex.Query{name: "", statement: sql}
-      DBConnection.query(conn, query, params, opts)
+      case DBConnection.prepare_execute(conn, query, params, opts) do
+        {:ok, _, query} ->
+          {:ok, query}
+        {:error, _} = error ->
+          error
+      end
     end
 
     def execute(conn, %{} = query, params, opts) do

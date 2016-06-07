@@ -42,11 +42,12 @@ defmodule Ecto.Mixfile do
      {:decimal, "~> 1.0"},
 
      # Drivers
-     {:mariaex, "~> 0.7.1", optional: true},
-     {:postgrex, "~> 0.11.1", optional: true},
+     #{:mariaex, "~> 0.7.1", optional: true},
+     {:postgrex, "~> 0.11.1", optional: true, github: "ericmj/postgrex", branch: "jf-db_conn-1_0"},
 
      # Optional
-     {:sbroker, "~> 0.7", optional: true},
+     {:sbroker, "~> 1.0.0-beta.1", optional: true, github: "fishcakez/sbroker",
+       tag: "v1.0.0-beta.1", override: true},
      {:poison, "~> 1.5 or ~> 2.0", optional: true},
 
      # Docs

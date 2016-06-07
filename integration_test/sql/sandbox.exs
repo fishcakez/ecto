@@ -6,21 +6,18 @@ defmodule Ecto.Integration.SandboxTest do
   alias Ecto.Integration.Post
 
   test "can use the repository when checked out" do
-    assert_raise RuntimeError, ~r"cannot find ownership process", fn ->
-      TestRepo.all(Post)
-    end
+    assert_raise DBConnection.OwnershipError, ~r"cannot find ownership process",
+      fn -> TestRepo.all(Post) end
     Sandbox.checkout(TestRepo)
     assert TestRepo.all(Post) == []
     Sandbox.checkin(TestRepo)
-    assert_raise RuntimeError, ~r"cannot find ownership process", fn ->
-      TestRepo.all(Post)
-    end
+    assert_raise DBConnection.OwnershipError, ~r"cannot find ownership process",
+      fn -> TestRepo.all(Post) end
   end
 
   test "can use the repository when allowed from another process" do
-    assert_raise RuntimeError, ~r"cannot find ownership process", fn ->
-      TestRepo.all(Post)
-    end
+    assert_raise DBConnection.OwnershipError, ~r"cannot find ownership process",
+      fn -> TestRepo.all(Post) end
 
     parent = self()
     Task.start_link fn ->
